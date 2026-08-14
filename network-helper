@@ -37,25 +37,9 @@ readonly DNSMASQ_UNIT="aos-unit-dnsmasq"
 
 readonly DHCP_LEASE_TIME="12h"
 
-readonly WAIT_INTERVAL=0.2
-
 lock() {
     exec 9>"$NET_LOCK"
     flock -x 9
-}
-
-wait_for_transient_cleanup() {
-    local -r unit_name="$1"
-
-    trap 'die "${EXIT_RUNTIME_ERROR}" "CRITICAL ERROR: Systemd timeout reached! ${unit_name} failed to clean up."' SIGTERM
-
-    systemctl stop "${unit_name}.service" || true
-
-    while [[ "$(systemctl show -p LoadState --value "${unit_name}.service" 2>/dev/null)" != "not-found" ]]; do
-        sleep "${WAIT_INTERVAL}"
-    done
-
-    trap - SIGTERM
 }
 
 table_present() {
@@ -632,8 +616,17 @@ do_startup() {
     log "Startup complete"
 }
 
+wait_for_node_units_cleanup() {
+    local unit
+    while read -r unit _; do
+        [[ $unit == aos-unit-node-*.service ]] || continue
+        wait_for_transient_cleanup "${unit%.service}"
+    done < <(systemctl list-units --all --type=service --no-legend --plain 'aos-unit-node-*' 2>/dev/null || true)
+}
+
 do_cleanup() {
     wait_for_transient_cleanup "${DNSMASQ_UNIT}"
+    wait_for_node_units_cleanup
 
     del_nat
     revert_resolved
