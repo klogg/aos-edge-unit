@@ -470,9 +470,9 @@ configure_and_start_dnsmasq() {
     local -r conf_file="$RUNTIME_DIRECTORY/dnsmasq.conf"
     local -r leases_file="$RUNTIME_DIRECTORY/dnsmasq.leases"
 
-    if [[ "$(systemctl show -p ActiveState --value "${DNSMASQ_UNIT}.service" 2>/dev/null)" == "active" ]]; then
-        die "${EXIT_RUNTIME_ERROR}" "${DNSMASQ_UNIT} service is already running"
-    fi
+    # systemd-run --collect may still hold the name from a previous run.
+    # Wait (stop + LoadState=not-found) instead of failing the first start.
+    wait_for_transient_cleanup "${DNSMASQ_UNIT}"
 
     mkdir -p "${RUNTIME_DIRECTORY}/${DHCP_HOSTS_DIR}" "${RUNTIME_DIRECTORY}/${DNS_HOSTS_DIR}"
     touch "$DNS_HOSTS_FILE"
