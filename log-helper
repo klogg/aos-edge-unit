@@ -36,6 +36,32 @@ die() {
     exit "$code"
 }
 
+# Block until a transient systemd unit is unloaded (LoadState=not-found).
+# systemd-run --collect forgets the unit name asynchronously; creating the
+# same name again before that finishes fails with "already loaded".
+wait_for_transient_cleanup() {
+    local unit_name="${1%.service}"
+    local -r interval=0.2
+    local load_state
+
+    load_state="$(systemctl show -p LoadState --value "${unit_name}.service" 2>/dev/null || true)"
+    if [[ $load_state == "not-found" || -z $load_state ]]; then
+        return 0
+    fi
+
+    trap 'die "${EXIT_RUNTIME_ERROR}" "CRITICAL ERROR: Systemd timeout reached! ${unit_name} failed to clean up."' SIGTERM
+
+    systemctl reset-failed "${unit_name}.service" 2>/dev/null || true
+    systemctl stop "${unit_name}.service" >/dev/null 2>&1 || true
+
+    log "Waiting for transient unit to unload: ${unit_name}"
+    while [[ "$(systemctl show -p LoadState --value "${unit_name}.service" 2>/dev/null)" != "not-found" ]]; do
+        sleep "${interval}"
+    done
+
+    trap - SIGTERM
+}
+
 ip_to_int() {
     local IFS=.
     local -a ipp

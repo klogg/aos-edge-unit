@@ -564,6 +564,7 @@ start_qemu_vm() {
     fi
 
     log "    Launching via systemd (unit: $unit_name)"
+    wait_for_transient_cleanup "$unit_name"
 
     local systemd_mem
     systemd_mem="$(normalize_memory_for_systemd "$memory")"
