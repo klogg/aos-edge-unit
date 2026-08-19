@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Send ACPI power-down to a QEMU VM via QMP, then wait for it to stop.
-# Invoked as ExecStop= in the transient VM unit so systemd's own
+# Invoked as ExecStop= in aos-unit-node@.service so systemd's own
 # TimeoutStopSec / KillSignal handling still applies if the guest
 # ignores the ACPI event.
 #

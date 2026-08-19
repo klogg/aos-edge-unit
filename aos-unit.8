@@ -8,7 +8,7 @@ aos-unit \- Multi-VM orchestration system for AosEdge edge deployments
 
 .SH DESCRIPTION
 .B aos-unit
-is a systemd-integrated service that orchestrates multiple QEMU/KVM virtual machines with deterministic networking, stateful logging, and automatic resource management. It is designed to run securely as an unprivileged user, launching isolated transient virtual machines for AosEdge multi-node deployments.
+is a systemd-integrated service that orchestrates multiple QEMU/KVM virtual machines with deterministic networking, stateful logging, and automatic resource management. It is designed to run securely as an unprivileged user, managing isolated virtual machines as static systemd template instances (\fIaos-unit-node@<name>.service\fR) for AosEdge multi-node deployments.
 
 .SH OPERATION
 .SS Startup Sequence
@@ -60,7 +60,7 @@ All VMs are accessible via the hardcoded \fBaos-unit\fR domain suffix (e.g., \fI
 The sidecar \fBdnsmasq\fR service manages IP allocation within the automatically-derived bridge subnet. To provide internet access to the isolated edge nodes, \fBaos-unit\fR configures \fBnftables\fR to dynamically masquerade outbound traffic originating from the virtual bridge, routing it through the host's primary internet-facing interface.
 
 .SS Dynamic Route Monitoring
-A dedicated \fBroute-monitor\fR service continuously watches for changes to the host's default route via netlink. When network changes are detected (e.g., switching from Ethernet to Wi-Fi), the monitor implements a debouncing mechanism: it waits for route changes to settle (default: 2 seconds of quiet time), then triggers a single NAT rule update. This "Smart NAT" approach ensures VMs maintain uninterrupted internet connectivity even during host network transitions, while avoiding excessive rule recalculations during rapid network events.
+While \fBaos-unit.service\fR is active, \fBrunner\fR continuously watches for changes to the host's default route via netlink. When network changes are detected (e.g., switching from Ethernet to Wi-Fi), the monitor implements a debouncing mechanism: it waits for route changes to settle (default: 2 seconds of quiet time), then triggers a single NAT rule update. This "Smart NAT" approach ensures VMs maintain uninterrupted internet connectivity even during host network transitions, while avoiding excessive rule recalculations during rapid network events.
 
 .SH SYSTEM INTEGRATION
 .B aos-unit
@@ -102,6 +102,9 @@ Infrastructure settings (DHCP CIDR, DNS port, upstream DNS, KVM enable)
 .TP
 .I /run/aos-unit/network.conf
 Runtime-generated network configuration (bridge name, bridge IP, netmask). Created at service startup from DHCP_CIDR calculation.
+.TP
+.I /run/aos-unit/nodes/<name>.env
+Per-node runtime environment for template instances (image path, MAC, tap, CPU, memory, and related QEMU settings). Written by \fBrunner\fR before starting \fIaos-unit-node@<name>.service\fR.
 .TP
 .I /run/aos-unit/dnsmasq.conf
 Runtime-generated dnsmasq configuration
