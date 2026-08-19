@@ -12,7 +12,6 @@ readonly LOG_TAG="aos-unit:runner"
 
 : "${RUNTIME_DIRECTORY:?RUNTIME_DIRECTORY is undefined. Check systemd unit.}"
 : "${STATE_DIRECTORY:?STATE_DIRECTORY is undefined. Check systemd unit.}"
-: "${LOGS_DIRECTORY:?LOGS_DIRECTORY is undefined. Check systemd unit.}"
 : "${CONFIGURATION_DIRECTORY:?CONFIGURATION_DIRECTORY is undefined. Check systemd unit.}"
 : "${NETWORK_CONFIG:?NETWORK_CONFIG is undefined. Check systemd unit.}"
 
@@ -32,14 +31,11 @@ readonly DEFAULT_MACHINE_TYPE_ARM64="virt"
 readonly DEFAULT_CPU_TYPE_AMD64="max"
 readonly DEFAULT_CPU_TYPE_ARM64="cortex-a57"
 
-readonly QEMU_DEBUG_OPTIONS="guest_errors,nochain"
-
-readonly OVMF_CODE_X86="/usr/share/OVMF/OVMF_CODE_4M.fd"
-readonly OVMF_VARS_X86="/usr/share/OVMF/OVMF_VARS_4M.fd"
-readonly OVMF_CODE_ARM="/usr/share/AAVMF/AAVMF_CODE.fd"
-readonly OVMF_VARS_ARM="/usr/share/AAVMF/AAVMF_VARS.fd"
-
 readonly DISK_FORMAT="qcow2"
+
+# Static template unit shipped with the package; instance name is the node name
+readonly NODE_UNIT_TEMPLATE="aos-unit-node@"
+readonly NODE_ENV_DIR="${RUNTIME_DIRECTORY}/nodes"
 
 # Globals set during initialisation and argument parsing
 HOST_ARCH=""
@@ -419,62 +415,73 @@ prepare_nodes() {
     log "Prepared ${#NODES_TO_START[@]} node(s) for startup"
 }
 
-rotate_debug_log() {
+derive_tap_name() {
+    local mac_addr="$1"
+
+    local mac_nocolon="${mac_addr//:/}"
+    local tap="aostap${mac_nocolon: -6}"
+    if ((${#tap} > 15)); then
+        die "$EXIT_RUNTIME_ERROR" "Generated tap name too long: $tap"
+    fi
+
+    printf '%s' "$tap"
+}
+
+# Everything the template unit and vm-launch need to know about one node.
+# The unit reads it as EnvironmentFile=/run/aos-unit/nodes/%i.env.
+write_node_env() {
     local node_name="$1"
-    local debug_log_path="$2"
+    local image_path="$2"
+    local arch="$3"
+    local mac_addr="$4"
+    local ip="$5"
+    local tap="$6"
+    local cpu_count="$7"
+    local memory="$8"
+    local machine_type="$9"
+    local cpu_type="${10}"
+    local use_kvm="${11}"
+    local uefi_boot="${12}"
 
-    log "  Forcing log rotation for previous debug session..."
+    local -r env_file="${NODE_ENV_DIR}/${node_name}.env"
 
-    local lr_conf="${RUNTIME_DIRECTORY}/${node_name}-logrotate.conf"
-    local lr_status="${RUNTIME_DIRECTORY}/${node_name}-logrotate.status"
+    mkdir -p "$NODE_ENV_DIR"
 
-    cat >"$lr_conf" <<EOF
-"${debug_log_path}" {
-    rotate 5
-    missingok
-    notifempty
-    copytruncate
-    compress
-    delaycompress
-}
+    local temp_file
+    temp_file="$(mktemp "${env_file}.XXXXXX")" ||
+        die "$EXIT_RUNTIME_ERROR" "Failed to create temporary env file for node: $node_name"
+
+    cat >"$temp_file" <<EOF
+NODE_IMAGE="${image_path}"
+NODE_ARCH="${arch}"
+NODE_MAC="${mac_addr}"
+NODE_IP="${ip}"
+NODE_TAP="${tap}"
+NODE_CPUS="${cpu_count}"
+NODE_MEM="${memory}"
+NODE_MACHINE="${machine_type}"
+NODE_CPU_TYPE="${cpu_type}"
+NODE_KVM="${use_kvm}"
+NODE_UEFI="${uefi_boot}"
 EOF
-    logrotate -s "$lr_status" -f "$lr_conf"
-    rm -f "$lr_conf" "$lr_status"
+
+    mv "$temp_file" "$env_file"
 }
 
-build_uefi_pflash_args() {
-    local arch="$1"
-    local node_name="$2"
-    # Output array passed by name (nameref)
-    local -n _cmd="$3"
+# Per-node cgroup caps cannot live in the static template unit: systemd does not
+# expand environment variables in resource directives. set-property writes them
+# over D-Bus into /run/systemd/system.control and needs no daemon-reload.
+apply_node_limits() {
+    local unit_name="$1"
+    local cpu_count="$2"
+    local memory="$3"
 
-    local ovmf_code ovmf_vars
-    case "$arch" in
-        x86_64)
-            ovmf_code="$OVMF_CODE_X86"
-            ovmf_vars="$OVMF_VARS_X86"
-            ;;
-        aarch64)
-            ovmf_code="$OVMF_CODE_ARM"
-            ovmf_vars="$OVMF_VARS_ARM"
-            ;;
-    esac
+    local systemd_mem
+    systemd_mem="$(normalize_memory_for_systemd "$memory")"
 
-    if [[ ! -f $ovmf_code || ! -f $ovmf_vars ]]; then
-        die "$EXIT_RUNTIME_ERROR" "UEFI requested but firmware missing for $arch at $ovmf_code"
-    fi
-
-    local ovmf_vars_vm="${RUNTIME_DIRECTORY}/${node_name}-VARS.fd"
-    if [[ ! -f $ovmf_vars_vm ]]; then
-        cp "$ovmf_vars" "$ovmf_vars_vm"
-        log "    Created UEFI vars: $(basename "$ovmf_vars_vm")"
-    fi
-
-    # Mount the read-only CODE and read-write VARS as pflash drives
-    _cmd+=(
-        -drive "if=pflash,format=raw,readonly=on,file=${ovmf_code}"
-        -drive "if=pflash,format=raw,file=${ovmf_vars_vm}"
-    )
+    systemctl set-property --runtime "$unit_name" \
+        "MemoryMax=${systemd_mem}" "CPUQuota=$((cpu_count * 100))%" ||
+        die "$EXIT_RUNTIME_ERROR" "Failed to apply resource limits to unit: $unit_name"
 }
 
 start_qemu_vm() {
@@ -503,139 +510,25 @@ start_qemu_vm() {
         log "    Network: MAC=$mac_addr, IP=(dynamic)"
     fi
 
-    local -r unit_name="aos-unit-node-${node_name}"
-    local -r qmp_socket="${RUNTIME_DIRECTORY}/${node_name}.qmp"
-    local -r socket_path="${RUNTIME_DIRECTORY}/${node_name}.serial"
-    local -r serial_log_path="${LOGS_DIRECTORY}/${node_name}-serial.log"
-    local -r debug_log_path="${LOGS_DIRECTORY}/${node_name}-debug.log"
+    local -r unit_name="${NODE_UNIT_TEMPLATE}${node_name}.service"
 
-    local qemu_cmd=(
-        "qemu-system-${arch}"
-        -name "$node_name"
-        -drive "file=${image_path},if=none,id=aos-image,format=${DISK_FORMAT}"
-        -device "virtio-scsi-pci,id=scsi"
-        -device "scsi-hd,drive=aos-image"
-        -machine "$machine_type"
-    )
+    local tap
+    tap="$(derive_tap_name "$mac_addr")"
 
-    if [[ $use_kvm == "true" ]]; then
-        qemu_cmd+=(-enable-kvm)
-        # KVM implementation for Arm practically demands -cpu host to function properly
-        if [[ $arch == "aarch64" ]]; then
-            qemu_cmd+=(-cpu host)
-        else
-            qemu_cmd+=(-cpu "$cpu_type")
-        fi
-    else
-        qemu_cmd+=(-cpu "$cpu_type")
-    fi
+    write_node_env "$node_name" "$image_path" "$arch" "$mac_addr" "$ip" "$tap" \
+        "$cpu_count" "$memory" "$machine_type" "$cpu_type" "$use_kvm" "$uefi_boot"
 
-    if [[ $uefi_boot == "true" ]]; then
-        build_uefi_pflash_args "$arch" "$node_name" qemu_cmd
-    fi
-
-    # Generate TAP interface name from MAC address
-    local mac_nocolon="${mac_addr//:/}"
-    local tap="aostap${mac_nocolon: -6}"
-    if ((${#tap} > 15)); then
-        die "$EXIT_RUNTIME_ERROR" "Generated tap name too long: $tap"
-    fi
-
-    # usage:
-    #   sudo socat -,raw,echo=0,escape=0x1d "UNIX-CONNECT:${socket_path}"
-    qemu_cmd+=(
-        -smp "cpus=${cpu_count}"
-        -m "$memory"
-        -netdev "tap,id=net0,ifname=${tap},script=no,downscript=no"
-        -device "virtio-net-pci,netdev=net0,mac=${mac_addr}"
-        -display none
-        -vga none
-        -chardev "socket,id=char0,path=${socket_path},server=on,wait=off,logfile=${serial_log_path},logappend=on"
-        -serial "chardev:char0"
-        -d "$QEMU_DEBUG_OPTIONS"
-        -D "${debug_log_path}"
-        -qmp "unix:${qmp_socket},server,nowait"
-    )
-
-    # On every startup QEMU will overwrite its own logs.
-    # To avoid losing them, enforce debug log rotation beforehand.
-    if [[ -f $debug_log_path ]]; then
-        rotate_debug_log "$node_name" "$debug_log_path"
-    fi
+    apply_node_limits "$unit_name" "$cpu_count" "$memory"
 
     log "    Launching via systemd (unit: $unit_name)"
 
-    local systemd_mem
-    systemd_mem="$(normalize_memory_for_systemd "$memory")"
+    # A previous run may have exhausted the start rate limit
+    systemctl reset-failed "$unit_name" 2>/dev/null || true
 
-    local exec_start_pre="${LIBEXEC_DIR}/network-helper add-vm ${mac_addr} ${node_name} ${tap}"
-    if [[ -n $ip ]]; then
-        exec_start_pre="${exec_start_pre} ${ip}"
-    fi
-
-    local exec_stop_post="${LIBEXEC_DIR}/network-helper del-vm ${mac_addr} ${node_name} ${tap}"
-    if [[ -n $ip ]]; then
-        exec_stop_post="${exec_stop_post} ${ip}"
-    fi
-
-    local -r exec_stop="${LIBEXEC_DIR}/vm-shutdown ${node_name}"
-
-    systemd-run \
-        --unit="$unit_name" \
-        --description="AosEdge Unit VM: ${node_name} (${arch})" \
-        --property="EnvironmentFile=${RUNTIME_DIRECTORY}/${NETWORK_CONFIG}" \
-        --setenv="RUNTIME_DIRECTORY=${RUNTIME_DIRECTORY}" \
-        --setenv="NETWORK_CONFIG=${NETWORK_CONFIG}" \
-        --setenv="DHCP_HOSTS_DIR=${DHCP_HOSTS_DIR}" \
-        --setenv="DNS_HOSTS_DIR=${DNS_HOSTS_DIR}" \
-        --slice=aos-unit.slice \
-        --property="Type=simple" \
-        --property="After=aos-unit.service" \
-        --property="BindsTo=aos-unit.service" \
-        --property="User=aos-unit" \
-        --property="Group=aos-unit" \
-        --property="AmbientCapabilities=CAP_NET_ADMIN" \
-        --property="CapabilityBoundingSet=CAP_NET_ADMIN" \
-        --property="RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6" \
-        --property="Restart=on-failure" \
-        --property="RestartSec=${HEALTH_RESTART_SEC:-5s}" \
-        --property="KillMode=control-group" \
-        --property="KillSignal=SIGTERM" \
-        --property="TimeoutStopSec=${VM_STOP_TIMEOUT:-60s}" \
-        --property="SendSIGKILL=yes" \
-        --property="NoNewPrivileges=yes" \
-        --property="PrivateTmp=yes" \
-        --property="ProtectHome=yes" \
-        --property="ProtectSystem=strict" \
-        --property="ProtectKernelTunables=yes" \
-        --property="ProtectKernelModules=yes" \
-        --property="ProtectControlGroups=yes" \
-        --property="ProtectKernelLogs=yes" \
-        --property="LockPersonality=yes" \
-        --property="RestrictNamespaces=yes" \
-        --property="RestrictRealtime=yes" \
-        --property="SystemCallArchitectures=native" \
-        --property="ReadWritePaths=${RUNTIME_DIRECTORY}" \
-        --property="ReadWritePaths=${LOGS_DIRECTORY}" \
-        --property="ReadWritePaths=${STATE_DIRECTORY}" \
-        --property="RestrictSUIDSGID=yes" \
-        --property="DevicePolicy=closed" \
-        --property="DeviceAllow=/dev/kvm rw" \
-        --property="DeviceAllow=/dev/vhost-net rw" \
-        --property="DeviceAllow=/dev/net/tun rw" \
-        --property="StartLimitIntervalSec=${HEALTH_RESTART_WINDOW:-300}" \
-        --property="StartLimitBurst=${HEALTH_MAX_RESTARTS:-3}" \
-        --property="TimeoutStartSec=${VM_START_TIMEOUT:-60s}" \
-        --property="ExecStartPre=${exec_start_pre}" \
-        --property="ExecStop=${exec_stop}" \
-        --property="ExecStopPost=${exec_stop_post}" \
-        --property="OnFailure=aos-unit-vm-failed@${unit_name}.service" \
-        --property="MemoryMax=${systemd_mem}" \
-        --property="OOMPolicy=kill" \
-        --property="CPUQuota=$((cpu_count * 100))%" \
-        --collect \
-        --quiet -- \
-        "${qemu_cmd[@]}"
+    # restart, not start: an instance left active by a merged restart job would
+    # otherwise keep running with the previous generation of its env file
+    systemctl restart "$unit_name" ||
+        die "$EXIT_RUNTIME_ERROR" "Failed to start unit: $unit_name"
 
     if ! wait_for_unit_active "$unit_name" 10; then
         die "${EXIT_RUNTIME_ERROR}" "Timeout waiting for unit to start: $node_name (check: systemctl status $unit_name)"

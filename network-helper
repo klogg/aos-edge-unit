@@ -35,6 +35,8 @@ readonly UPSTREAM_DNS="${UPSTREAM_DNS:-127.0.0.53}"
 
 readonly DNSMASQ_UNIT="aos-unit-dnsmasq"
 
+readonly NODE_UNIT_TEMPLATE="aos-unit-node@"
+
 readonly DHCP_LEASE_TIME="12h"
 
 readonly WAIT_INTERVAL=0.2
@@ -632,8 +634,30 @@ do_startup() {
     log "Startup complete"
 }
 
+wait_for_node_units_cleanup() {
+    local unit
+    while read -r unit _; do
+        [[ $unit == "${NODE_UNIT_TEMPLATE}"*.service ]] || continue
+
+        # The bridge and the taps must not disappear from under a live guest
+        wait_for_unit_stopped "$unit"
+
+        # A guest that ignored the ACPI power-down gets SIGKILLed on timeout and
+        # leaves the unit in "failed". Clear it so a plain `systemctl stop
+        # aos-unit` does not leave failed units behind for the operator to see.
+        #
+        # NOTE: the per-node MemoryMax/CPUQuota drop-ins in
+        # /run/systemd/system.control are deliberately left alone. Removing them
+        # needs `systemctl revert`, which polkit gates behind manage-unit-files
+        # (we only grant manage-units), and they are inert: runner rewrites them
+        # on every start and /run is cleared on reboot.
+        systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+    done < <(systemctl list-units --all --type=service --no-legend --plain "${NODE_UNIT_TEMPLATE}*" 2>/dev/null || true)
+}
+
 do_cleanup() {
     wait_for_transient_cleanup "${DNSMASQ_UNIT}"
+    wait_for_node_units_cleanup
 
     del_nat
     revert_resolved

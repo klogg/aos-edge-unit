@@ -14,10 +14,10 @@ is a systemd-integrated service that orchestrates multiple QEMU/KVM virtual mach
 .SS Startup Sequence
 When the \fBaos-unit\fR service is started, the system first initializes the required network environment. A unique virtual bridge is created with a name derived from the host's machine-id (\fBaosbr{machine-id:0:6}\fR). Network configuration (bridge IP, DHCP range, netmask) is automatically calculated from the configured CIDR prefix and written to a runtime configuration file (\fI/run/aos-unit/network.conf\fR). A dedicated \fBdnsmasq\fR systemd service is started to handle isolated DHCP and DNS resolution. Host \fBnftables\fR rules are also configured for routing and NAT masquerading.
 .br
-Following network initialization, the main orchestrator parses the YAML configuration. For each defined node, it provisions the required runtime files and uses \fBsystemd-run\fR to spawn the virtual machine as an independent, transient systemd service (e.g., \fIaos-unit-node-<name>.service\fR). Network helper utilities are invoked dynamically during this VM creation phase to register MAC addresses and IP allocations with the running DNS/DHCP server.
+Following network initialization, the main orchestrator parses the YAML configuration. For each defined node, it writes the node's settings to \fI/run/aos-unit/nodes/<name>.env\fR, applies the configured CPU and memory limits with \fBsystemctl set-property\fR, and starts an instance of the packaged template unit \fIaos-unit-node@<name>.service\fR. Network helper utilities are invoked from the instance itself (\fBExecStartPre\fR / \fBExecStopPost\fR) to register and unregister MAC addresses and IP allocations with the running DNS/DHCP server.
 
 .SS Shutdown Sequence
-When the \fBaos-unit\fR service is stopped, each VM unit receives an ACPI power-down event via its QMP socket (\fBvm-shutdown\fR). The guest OS is given the configured \fBTimeoutStopSec\fR to perform a clean shutdown. If the guest does not exit within that window, systemd sends \fBSIGTERM\fR followed by \fBSIGKILL\fR. Once all VMs have halted, the orchestrator tears down the network bridge, flushes the \fBnftables\fR rules, and stops the associated \fBdnsmasq\fR and \fBroute-monitor\fR services, leaving the host system entirely clean.
+When the \fBaos-unit\fR service is stopped, each VM unit receives an ACPI power-down event via its QMP socket (\fBvm-shutdown\fR). The guest OS is given the configured \fBTimeoutStopSec\fR to perform a clean shutdown. If the guest does not exit within that window, systemd sends \fBSIGTERM\fR followed by \fBSIGKILL\fR. Once all VMs have halted, the orchestrator tears down the network bridge, flushes the \fBnftables\fR rules, and stops the associated \fBdnsmasq\fR service, leaving the host system entirely clean.
 
 .SH USER AND SECURITY
 The entire orchestration suite is designed to run rootless. All processes, including the main orchestrator, the network helpers, and the QEMU virtual machines, execute strictly under the \fBaos-unit\fR user and \fBaos-unit\fR group. Elevated network operations (like bridge creation) are permitted strictly within the systemd unit via specific Linux capabilities (e.g., \fBCAP_NET_ADMIN\fR), ensuring maximum host security without requiring full privileges.
@@ -90,7 +90,7 @@ Transient failures (e.g., QEMU crash, host bridge failure). systemd will automat
 Permanent failures (e.g., missing YAML, malformed configs, invalid CIDR). systemd will deliberately \fBNOT\fR restart the service to prevent infinite loops. Manual intervention is required.
 
 .SS VM Health Monitoring
-Individual VMs (\fIaos-unit-node-*.service\fR) manage their own restart policies. If a guest OS crashes, systemd will automatically restart that specific transient unit immediately, honoring the burst limits defined in the orchestrator.
+Individual VMs (\fIaos-unit-node@*.service\fR) manage their own restart policies. If a guest OS crashes, systemd will automatically restart that specific node instance immediately, honoring the burst limits defined in the template unit.
 
 .SH FILES
 .TP

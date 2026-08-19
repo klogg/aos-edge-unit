@@ -12,11 +12,13 @@ service-cleanup usr/libexec/aos-unit/
 vm-failed-handler usr/libexec/aos-unit/
 dnsmasq-lease-hook usr/libexec/aos-unit/
 vm-shutdown usr/libexec/aos-unit/
+vm-launch usr/libexec/aos-unit/
 
 # Systemd units
 aos-unit.service lib/systemd/system/
 aos-unit.slice lib/systemd/system/
 aos-unit-vm-failed@.service lib/systemd/system/
+aos-unit-node@.service lib/systemd/system/
 
 # Configuration files (conffiles - preserved on upgrade)
 runtime.conf etc/aos-unit/

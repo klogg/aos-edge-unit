@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# Build the QEMU command line for one node and exec it.
+# Invoked as ExecStart= in aos-unit-node@.service; every per-node value arrives
+# through the environment file that runner generates in /run/aos-unit/nodes.
+#
+# Copyright (c) 2018-2026 EPAM Systems Inc.
+
+set -Eeuo pipefail
+
+LIBEXEC_DIR="$(dirname "$(realpath "$0")")"
+readonly LIBEXEC_DIR
+readonly LOG_TAG="aos-unit:vm-launch"
+. "${LIBEXEC_DIR}/log-helper"
+
+: "${RUNTIME_DIRECTORY:?RUNTIME_DIRECTORY is undefined. Check systemd unit.}"
+: "${LOGS_DIRECTORY:?LOGS_DIRECTORY is undefined. Check systemd unit.}"
+
+: "${NODE_IMAGE:?NODE_IMAGE missing in node environment file}"
+: "${NODE_ARCH:?NODE_ARCH missing in node environment file}"
+: "${NODE_MAC:?NODE_MAC missing in node environment file}"
+: "${NODE_TAP:?NODE_TAP missing in node environment file}"
+: "${NODE_CPUS:?NODE_CPUS missing in node environment file}"
+: "${NODE_MEM:?NODE_MEM missing in node environment file}"
+: "${NODE_MACHINE:?NODE_MACHINE missing in node environment file}"
+: "${NODE_CPU_TYPE:?NODE_CPU_TYPE missing in node environment file}"
+: "${NODE_KVM:?NODE_KVM missing in node environment file}"
+: "${NODE_UEFI:?NODE_UEFI missing in node environment file}"
+
+readonly DISK_FORMAT="qcow2"
+
+readonly QEMU_DEBUG_OPTIONS="guest_errors,nochain"
+
+readonly OVMF_CODE_X86="/usr/share/OVMF/OVMF_CODE_4M.fd"
+readonly OVMF_VARS_X86="/usr/share/OVMF/OVMF_VARS_4M.fd"
+readonly OVMF_CODE_ARM="/usr/share/AAVMF/AAVMF_CODE.fd"
+readonly OVMF_VARS_ARM="/usr/share/AAVMF/AAVMF_VARS.fd"
+
+# Assembled by build_qemu_cmd(), consumed by main()
+declare -a QEMU_CMD=()
+
+# QEMU truncates its own debug log on every start, so rotate before launching.
+# This also covers systemd's automatic Restart=, where runner is not involved.
+rotate_debug_log() {
+    local node_name="$1"
+    local debug_log_path="$2"
+
+    log "Forcing log rotation for previous debug session..."
+
+    local lr_conf="${RUNTIME_DIRECTORY}/${node_name}-logrotate.conf"
+    local lr_status="${RUNTIME_DIRECTORY}/${node_name}-logrotate.status"
+
+    cat >"$lr_conf" <<EOF
+"${debug_log_path}" {
+    rotate 5
+    missingok
+    notifempty
+    copytruncate
+    compress
+    delaycompress
+}
+EOF
+    logrotate -s "$lr_status" -f "$lr_conf"
+    rm -f "$lr_conf" "$lr_status"
+}
+
+build_uefi_pflash_args() {
+    local arch="$1"
+    local node_name="$2"
+
+    local ovmf_code ovmf_vars
+    case "$arch" in
+        x86_64)
+            ovmf_code="$OVMF_CODE_X86"
+            ovmf_vars="$OVMF_VARS_X86"
+            ;;
+        aarch64)
+            ovmf_code="$OVMF_CODE_ARM"
+            ovmf_vars="$OVMF_VARS_ARM"
+            ;;
+        *) die "$EXIT_CONFIG_ERROR" "Unknown architecture: $arch" ;;
+    esac
+
+    if [[ ! -f $ovmf_code || ! -f $ovmf_vars ]]; then
+        die "$EXIT_RUNTIME_ERROR" "UEFI requested but firmware missing for $arch at $ovmf_code"
+    fi
+
+    local ovmf_vars_vm="${RUNTIME_DIRECTORY}/${node_name}-VARS.fd"
+    if [[ ! -f $ovmf_vars_vm ]]; then
+        cp "$ovmf_vars" "$ovmf_vars_vm"
+        log "Created UEFI vars: ${ovmf_vars_vm##*/}"
+    fi
+
+    # Mount the read-only CODE and read-write VARS as pflash drives
+    QEMU_CMD+=(
+        -drive "if=pflash,format=raw,readonly=on,file=${ovmf_code}"
+        -drive "if=pflash,format=raw,file=${ovmf_vars_vm}"
+    )
+}
+
+build_qemu_cmd() {
+    local node_name="$1"
+
+    local -r qmp_socket="${RUNTIME_DIRECTORY}/${node_name}.qmp"
+    local -r socket_path="${RUNTIME_DIRECTORY}/${node_name}.serial"
+    local -r serial_log_path="${LOGS_DIRECTORY}/${node_name}-serial.log"
+    local -r debug_log_path="${LOGS_DIRECTORY}/${node_name}-debug.log"
+
+    QEMU_CMD+=(
+        "qemu-system-${NODE_ARCH}"
+        -name "$node_name"
+        -drive "file=${NODE_IMAGE},if=none,id=aos-image,format=${DISK_FORMAT}"
+        -device "virtio-scsi-pci,id=scsi"
+        -device "scsi-hd,drive=aos-image"
+        -machine "$NODE_MACHINE"
+    )
+
+    if [[ $NODE_KVM == "true" ]]; then
+        QEMU_CMD+=(-enable-kvm)
+        # KVM implementation for Arm practically demands -cpu host to function properly
+        if [[ $NODE_ARCH == "aarch64" ]]; then
+            QEMU_CMD+=(-cpu host)
+        else
+            QEMU_CMD+=(-cpu "$NODE_CPU_TYPE")
+        fi
+    else
+        QEMU_CMD+=(-cpu "$NODE_CPU_TYPE")
+    fi
+
+    if [[ $NODE_UEFI == "true" ]]; then
+        build_uefi_pflash_args "$NODE_ARCH" "$node_name"
+    fi
+
+    # usage:
+    #   sudo socat -,raw,echo=0,escape=0x1d "UNIX-CONNECT:${socket_path}"
+    QEMU_CMD+=(
+        -smp "cpus=${NODE_CPUS}"
+        -m "$NODE_MEM"
+        -netdev "tap,id=net0,ifname=${NODE_TAP},script=no,downscript=no"
+        -device "virtio-net-pci,netdev=net0,mac=${NODE_MAC}"
+        -display none
+        -vga none
+        -chardev "socket,id=char0,path=${socket_path},server=on,wait=off,logfile=${serial_log_path},logappend=on"
+        -serial "chardev:char0"
+        -d "$QEMU_DEBUG_OPTIONS"
+        -D "${debug_log_path}"
+        -qmp "unix:${qmp_socket},server,nowait"
+    )
+
+    if [[ -f $debug_log_path ]]; then
+        rotate_debug_log "$node_name" "$debug_log_path"
+    fi
+}
+
+main() {
+    local -r node_name="${1:?node name required}"
+
+    log "Launching ${node_name}: ${NODE_ARCH}, ${NODE_CPUS} vCPU, ${NODE_MEM} RAM, KVM=${NODE_KVM}"
+
+    build_qemu_cmd "$node_name"
+
+    exec "${QEMU_CMD[@]}"
+}
+
+main "$@"
