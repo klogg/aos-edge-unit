@@ -36,6 +36,35 @@ die() {
     exit "$code"
 }
 
+# Block until a systemd unit is no longer running. Unlike transient units, a
+# unit shipped as a file keeps its name after stopping, so LoadState never
+# leaves "loaded" and ActiveState is the only usable signal.
+wait_for_unit_stopped() {
+    local -r unit_name="$1"
+    local -r interval=0.2
+    local state
+
+    state="$(systemctl show -p ActiveState --value "$unit_name" 2>/dev/null || true)"
+    if [[ -z $state || $state == "inactive" || $state == "failed" ]]; then
+        return 0
+    fi
+
+    trap 'die "${EXIT_RUNTIME_ERROR}" "CRITICAL ERROR: Systemd timeout reached! ${unit_name} failed to stop."' SIGTERM
+
+    systemctl stop "$unit_name" >/dev/null 2>&1 || true
+
+    log "Waiting for unit to stop: ${unit_name}"
+    while true; do
+        state="$(systemctl show -p ActiveState --value "$unit_name" 2>/dev/null)"
+        if [[ $state == "inactive" || $state == "failed" ]]; then
+            break
+        fi
+        sleep "${interval}"
+    done
+
+    trap - SIGTERM
+}
+
 ip_to_int() {
     local IFS=.
     local -a ipp

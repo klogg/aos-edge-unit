@@ -35,8 +35,10 @@ Configuration files:
   /etc/aos-unit/runtime.conf           - Infrastructure settings
   /etc/aos-unit/unit_config.yaml       - Node definitions
 Systemd units:
-  /lib/systemd/system/aos-unit.service - Main service
-  /lib/systemd/system/aos-unit.slice   - Resource management
+  /lib/systemd/system/aos-unit.service          - Main service
+  /lib/systemd/system/aos-unit-dnsmasq.service  - DNS/DHCP sidecar
+  /lib/systemd/system/aos-unit-node@.service    - Per-node VM template
+  /lib/systemd/system/aos-unit.slice            - Resource management
 
 System user created:
   aos-unit (member of kvm group)

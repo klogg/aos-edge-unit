@@ -35,27 +35,14 @@ readonly UPSTREAM_DNS="${UPSTREAM_DNS:-127.0.0.53}"
 
 readonly DNSMASQ_UNIT="aos-unit-dnsmasq"
 
-readonly DHCP_LEASE_TIME="12h"
+readonly NODE_UNIT_TEMPLATE="aos-unit-node@"
+readonly NODE_START_GATE="${RUNTIME_DIRECTORY}/allow-node-start"
 
-readonly WAIT_INTERVAL=0.2
+readonly DHCP_LEASE_TIME="12h"
 
 lock() {
     exec 9>"$NET_LOCK"
     flock -x 9
-}
-
-wait_for_transient_cleanup() {
-    local -r unit_name="$1"
-
-    trap 'die "${EXIT_RUNTIME_ERROR}" "CRITICAL ERROR: Systemd timeout reached! ${unit_name} failed to clean up."' SIGTERM
-
-    systemctl stop "${unit_name}.service" || true
-
-    while [[ "$(systemctl show -p LoadState --value "${unit_name}.service" 2>/dev/null)" != "not-found" ]]; do
-        sleep "${WAIT_INTERVAL}"
-    done
-
-    trap - SIGTERM
 }
 
 table_present() {
@@ -485,10 +472,7 @@ EOF
 configure_and_start_dnsmasq() {
     local -r conf_file="$RUNTIME_DIRECTORY/dnsmasq.conf"
     local -r leases_file="$RUNTIME_DIRECTORY/dnsmasq.leases"
-
-    if [[ "$(systemctl show -p ActiveState --value "${DNSMASQ_UNIT}.service" 2>/dev/null)" == "active" ]]; then
-        die "${EXIT_RUNTIME_ERROR}" "${DNSMASQ_UNIT} service is already running"
-    fi
+    local -r unit_name="${DNSMASQ_UNIT}.service"
 
     mkdir -p "${RUNTIME_DIRECTORY}/${DHCP_HOSTS_DIR}" "${RUNTIME_DIRECTORY}/${DNS_HOSTS_DIR}"
     touch "$DNS_HOSTS_FILE"
@@ -532,51 +516,19 @@ EOF
         die "${EXIT_RUNTIME_ERROR}" "dnsmasq config test failed"
     }
 
-    log "Starting dnsmasq as transient unit: ${DNSMASQ_UNIT}"
-    systemd-run \
-        --unit="$DNSMASQ_UNIT" \
-        --description="AosEdge dnsmasq @${BRIDGE_IP}" \
-        --property="EnvironmentFile=${RUNTIME_DIRECTORY}/${NETWORK_CONFIG}" \
-        --setenv="RUNTIME_DIRECTORY=${RUNTIME_DIRECTORY}" \
-        --setenv="NETWORK_CONFIG=${NETWORK_CONFIG}" \
-        --setenv="DHCP_HOSTS_DIR=${DHCP_HOSTS_DIR}" \
-        --setenv="DNS_HOSTS_DIR=${DNS_HOSTS_DIR}" \
-        --property="Type=simple" \
-        --property="BindsTo=aos-unit.service" \
-        --property="PartOf=aos-unit.service" \
-        --property="User=aos-unit" \
-        --property="Group=aos-unit" \
-        --property="AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW" \
-        --property="CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW" \
-        --property="RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6" \
-        --property="Restart=on-failure" \
-        --property="RestartSec=1s" \
-        --property="KillMode=control-group" \
-        --property="KillSignal=SIGTERM" \
-        --property="TimeoutStopSec=5s" \
-        --property="SendSIGKILL=yes" \
-        --property="NoNewPrivileges=yes" \
-        --property="PrivateTmp=yes" \
-        --property="ProtectSystem=strict" \
-        --property="ProtectHome=yes" \
-        --property="ProtectKernelTunables=yes" \
-        --property="ProtectKernelModules=yes" \
-        --property="ProtectControlGroups=yes" \
-        --property="ProtectKernelLogs=yes" \
-        --property="PrivateDevices=yes" \
-        --property="LockPersonality=yes" \
-        --property="MemoryDenyWriteExecute=yes" \
-        --property="RestrictNamespaces=yes" \
-        --property="RestrictRealtime=yes" \
-        --property="SystemCallArchitectures=native" \
-        --property="ReadWritePaths=${RUNTIME_DIRECTORY}" \
-        --collect \
-        --quiet -- \
-        /usr/sbin/dnsmasq --keep-in-foreground --conf-file="$conf_file"
+    # Conf first, then restart: a BindsTo auto-restart during manager restart
+    # must not crash us. restart is a no-op-or-serialized job, not "already exists".
+    systemctl reset-failed "$unit_name" 2>/dev/null || true
 
-    if ! systemctl is-active --quiet "${DNSMASQ_UNIT}.service" 2>/dev/null; then
-        systemctl --no-pager -l status "${DNSMASQ_UNIT}.service" 2>&1 | error_multi || true
-        die "${EXIT_RUNTIME_ERROR}" "dnsmasq transient unit failed to start: ${DNSMASQ_UNIT}"
+    log "Starting dnsmasq (unit: ${unit_name})"
+    systemctl restart "$unit_name" || {
+        systemctl --no-pager -l status "$unit_name" 2>&1 | error_multi || true
+        die "${EXIT_RUNTIME_ERROR}" "Failed to start unit: ${unit_name}"
+    }
+
+    if ! systemctl is-active --quiet "$unit_name" 2>/dev/null; then
+        systemctl --no-pager -l status "$unit_name" 2>&1 | error_multi || true
+        die "${EXIT_RUNTIME_ERROR}" "dnsmasq unit failed to become active: ${unit_name}"
     fi
 }
 
@@ -632,8 +584,36 @@ do_startup() {
     log "Startup complete"
 }
 
+wait_for_node_units_cleanup() {
+    local unit
+    while read -r unit _; do
+        [[ $unit == "${NODE_UNIT_TEMPLATE}"*.service ]] || continue
+
+        # The bridge and the taps must not disappear from under a live guest
+        wait_for_unit_stopped "$unit"
+
+        # A guest that ignored the ACPI power-down gets SIGKILLed on timeout and
+        # leaves the unit in "failed". Clear it so a plain `systemctl stop
+        # aos-unit` does not leave failed units behind for the operator to see.
+        #
+        # NOTE: the per-node MemoryMax/CPUQuota drop-ins in
+        # /run/systemd/system.control are deliberately left alone. Removing them
+        # needs `systemctl revert`, which polkit gates behind manage-unit-files
+        # (we only grant manage-units), and they are inert: runner rewrites them
+        # on every start and /run is cleared on reboot.
+        systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+    done < <(systemctl list-units --all --type=service --no-legend --plain "${NODE_UNIT_TEMPLATE}*" 2>/dev/null || true)
+}
+
 do_cleanup() {
-    wait_for_transient_cleanup "${DNSMASQ_UNIT}"
+    # Close the node start gate before waiting: TimeoutStopSec + Restart= must
+    # not spawn a guest while this teardown is still running.
+    rm -f "${NODE_START_GATE}"
+
+    # Nodes first: guests must not lose the bridge/DHCP while still running.
+    wait_for_node_units_cleanup
+    wait_for_unit_stopped "${DNSMASQ_UNIT}.service"
+    systemctl reset-failed "${DNSMASQ_UNIT}.service" >/dev/null 2>&1 || true
 
     del_nat
     revert_resolved

@@ -61,9 +61,9 @@ Congratulations! You have successfully deployed your virtual AosEdge Unit. Now y
 
 The architecture favors determinism, explicit failure semantics, and controlled recovery over opaque background behavior.
 
-* **Systemd-Native Lifecycle:** VMs are not mere background processes; each node runs as a transient systemd service unit (aos-unit-node-\<name\>.service) allowing for native monitoring, auto-restarts, and dependency management.
+* **Systemd-Native Lifecycle:** VMs and the DNS/DHCP sidecar are packaged systemd units (`aos-unit-node@<name>.service`, `aos-unit-dnsmasq.service`). The only operator command is `systemctl start|stop|restart aos-unit`. Because the unit names are static, restarting the manager is an ordinary systemd restart rather than a race to re-create unit names.
 * **Security-Focused Execution:** Operates as a dedicated, unprivileged aos-unit system user. Elevated network operations are handled strictly within the systemd unit via minimal Linux capabilities and specific PolicyKit rules.  
-* **Resource Management:** Per-VM CPU and memory limits are enforced via cgroups v2 unit properties. All VMs are grouped under aos-unit.slice for hierarchical control over the emulation cluster's total footprint.  
+* **Resource Management:** Per-VM CPU and memory limits from unit_config.yaml are enforced via cgroups v2, applied to each node instance at start time with systemctl set-property. All VMs are grouped under aos-unit.slice for hierarchical control over the emulation cluster's total footprint.  
 * **Portable Virtualization:** Defaults to KVM hardware acceleration for near-native performance. If /dev/kvm is unavailable, it gracefully falls back to QEMU software emulation (TCG) to enable cross-architecture testing.
 
 ### **FHS-Aligned Layout**
@@ -82,26 +82,25 @@ AosEdge Unit is implemented as a layered set of systemd units and focused helper
 ```
 systemd (host)
 ├── aos-unit.service                     # Main manager (entry point)
-│   ├── ExecStartPre: service-startup    # Bridge + nftables base + resolved routing
-│   ├── ExecStart: runner                # Parse YAML, spawn VMs + sidecars + monitors
+│   ├── ExecStartPre: service-startup    # Bridge + dnsmasq.conf + restart aos-unit-dnsmasq
+│   ├── ExecStart: runner                # Parse YAML, start node instances, monitor routes
 │   ├── (runtime): route-monitor         # Watches uplink/default-route changes via netlink
 │   ├── (runtime): network-helper        # Applies NAT rules; updated on route changes
-│   ├── ExecStop: vm-shutdown            # Send ACPI shutdown to qemu VMs
-│   └── ExecStopPost: service-cleanup    # Teardown bridge, nftables
+│   └── ExecStopPost: service-cleanup    # Close start gate; wait nodes, then dnsmasq; tear down NAT/bridge
 │
-├── aos-unit-dnsmasq.service             # Transient unit (DHCP + DNS on alt port)
+├── aos-unit-dnsmasq.service             # Static unit (DHCP + DNS on alt port)
 │   └── dnsmasq-lease-hook               # DHCP lease event hook
-│
-├── aos-unit-route-monitor.service       # Transient unit (dynamic NAT updates)
-│   └── route-monitor                    # Debounced netlink route monitor
 │
 ├── aos-unit-vm-failed@<name>.service    # Triggered on VM node <name> failure
 │   └── vm-failed-handler                # Appends forensic data to persistent logs
 │
 └── aos-unit.slice                       # VM-only resource hierarchy
-    ├── aos-unit-node-main.service       # Transient VM unit
-    │   └── qemu-system-*                # QEMU process (KVM or TCG)
-    └── aos-unit-node-secondary.service  # Transient VM unit
+    ├── aos-unit-node@main.service       # Instance of the aos-unit-node@ template
+    │   ├── ExecStartPre: network-helper  # Register tap + DHCP reservation
+    │   ├── ExecStart: vm-launch          # Builds argv, execs qemu-system-* (KVM or TCG)
+    │   ├── ExecStop: vm-shutdown         # Send ACPI power-down via QMP
+    │   └── ExecStopPost: network-helper  # Unregister tap + DHCP reservation
+    └── aos-unit-node@secondary.service  # Instance of the aos-unit-node@ template
 ```
 
 ## **Dynamic Networking & "Smart NAT"**
@@ -119,7 +118,7 @@ Networking is not static. The host's default route may change (e.g., Ethernet �
 
 AosEdge Unit deliberately separates VM-level failures from orchestrator-level failures and configuration errors.
 
-* **VM-Level Faults:** If a guest OS crashes, systemd detects the unit failure. Restart behavior is governed strictly by the transient unit's systemd policy, preventing cascading teardowns of the entire environment.  
+* **VM-Level Faults:** Node units use `Restart=on-abort`: if QEMU itself aborts (uncaught signal or core dump), systemd restarts that instance. A planned `aos-unit` stop that hits `TimeoutStopSec` (guest ignored ACPI) does not spawn a replacement guest. Cluster recovery is `systemctl restart aos-unit`.  
 * **Orchestrator Exit Codes (aos-unit.service):**  
   * 0: clean shutdown.  
   * 1: runtime failure (Transient errors, systemd will automatically restart).  
@@ -128,7 +127,7 @@ AosEdge Unit deliberately separates VM-level failures from orchestrator-level fa
 ### **Observability & Troubleshooting**
 
 * **Check Entire Cluster Status:**  
-  `systemctl list-units 'aos-unit-node-*'`
+  `systemctl list-units 'aos-unit-node@*'`
 * **Follow Aggregated Logs:**  
   `journalctl -u 'aos-*' -f`
 * **Live Serial Console:** Connect to the live virtual UART without interrupting persistent logging:  

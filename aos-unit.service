@@ -4,6 +4,10 @@ Documentation=man:aos-unit(8) man:aos-unit.conf(5)
 After=network-online.target
 Wants=network-online.target
 
+# Stop the sidecar with the manager without restarting it as part of this
+# unit's start job (BindsTo on the sidecar would bounce it on restart).
+PropagatesStopTo=aos-unit-dnsmasq.service
+
 # Limit restart attempts to prevent infinite loops on runtime errors
 StartLimitBurst=5
 StartLimitIntervalSec=60s
