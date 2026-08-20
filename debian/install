@@ -19,6 +19,7 @@ aos-unit.service lib/systemd/system/
 aos-unit.slice lib/systemd/system/
 aos-unit-vm-failed@.service lib/systemd/system/
 aos-unit-node@.service lib/systemd/system/
+aos-unit-dnsmasq.service lib/systemd/system/
 
 # Configuration files (conffiles - preserved on upgrade)
 runtime.conf etc/aos-unit/

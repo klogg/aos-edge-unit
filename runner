@@ -36,6 +36,9 @@ readonly DISK_FORMAT="qcow2"
 # Static template unit shipped with the package; instance name is the node name
 readonly NODE_UNIT_TEMPLATE="aos-unit-node@"
 readonly NODE_ENV_DIR="${RUNTIME_DIRECTORY}/nodes"
+# Node units ExecCondition this file. Removed first on stop so Restart= after
+# TimeoutStopSec cannot spawn a guest while aos-unit is going down.
+readonly NODE_START_GATE="${RUNTIME_DIRECTORY}/allow-node-start"
 
 # Globals set during initialisation and argument parsing
 HOST_ARCH=""
@@ -558,6 +561,19 @@ launch_all_vms() {
     log "Runner active - VMs managed by systemd"
 }
 
+allow_node_starts() {
+    : >"${NODE_START_GATE}"
+}
+
+deny_node_starts() {
+    rm -f "${NODE_START_GATE}"
+}
+
+shutdown_runner() {
+    deny_node_starts
+    exit 0
+}
+
 cleanup_route_monitor() {
     if [[ -n ${IPMON_PID} ]]; then
         log "Shutting down route monitor..."
@@ -622,7 +638,7 @@ start_route_monitoring() {
 
     # Set up cleanup handler for route monitor
     trap cleanup_route_monitor EXIT
-    trap 'exit 0' INT TERM
+    trap shutdown_runner INT TERM
 
     route_monitor_loop
 }
@@ -637,10 +653,11 @@ main() {
     validate_config
     prepare_nodes
 
-    trap 'exit 0' SIGTERM SIGINT
+    trap shutdown_runner SIGTERM SIGINT
 
     log "AosEdge Unit Runner starting (PID: $$)"
 
+    allow_node_starts
     launch_all_vms
 
     if [[ -z ${INTERNET_INTERFACE:-} ]]; then

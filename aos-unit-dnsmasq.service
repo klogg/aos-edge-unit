@@ -1,0 +1,57 @@
+[Unit]
+Description=AosEdge Unit DNS/DHCP sidecar
+Documentation=man:aos-unit(8)
+
+# Started only from aos-unit ExecStartPre after dnsmasq.conf exists.
+# Do not After= or BindsTo= aos-unit.service: both pull this unit into the
+# manager's restart job and bounce it before conf/hosts are ready.
+# Stop is propagated from aos-unit.service via PropagatesStopTo=.
+ConditionPathExists=/run/aos-unit/dnsmasq.conf
+
+[Service]
+Type=simple
+
+User=aos-unit
+Group=aos-unit
+
+EnvironmentFile=/run/aos-unit/network.conf
+Environment="RUNTIME_DIRECTORY=/run/aos-unit"
+Environment="NETWORK_CONFIG=network.conf"
+Environment="DHCP_HOSTS_DIR=dnsmasq.d/dhcp-hosts"
+Environment="DNS_HOSTS_DIR=dnsmasq.d/dns-hosts"
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Conf is written by network-helper immediately before this unit is restarted.
+# Missing file is fatal on purpose.
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/run/aos-unit/dnsmasq.conf
+
+Restart=on-failure
+RestartSec=1s
+TimeoutStopSec=5s
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=yes
+
+# --- Security hardening ---
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+PrivateDevices=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+ReadWritePaths=/run/aos-unit

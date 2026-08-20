@@ -11,6 +11,15 @@ readonly LOG_TAG="aos-unit:vm-failed"
 
 : "${LOGS_DIRECTORY:?Environment variable LOGS_DIRECTORY is undefined}"
 
+# Same path as aos-unit-node@.service ExecCondition. Missing means the manager
+# is tearing down (or has not started nodes yet). Do not call systemctl
+# is-active here: that can block on PID 1 during the same stop job.
+readonly NODE_START_GATE="/run/aos-unit/allow-node-start"
+
+is_planned_stop_failure() {
+    [[ ! -e $NODE_START_GATE ]]
+}
+
 log_vm_failure() {
     local unit="$1"
 
@@ -30,6 +39,10 @@ log_vm_failure() {
 
 main() {
     local -r unit="${1:?unit required}"
+    if is_planned_stop_failure; then
+        log "Ignoring ${unit} (node start gate is closed)"
+        return 0
+    fi
     log_vm_failure "$unit"
 }
 
